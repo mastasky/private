@@ -38,15 +38,44 @@ def api(method, path, body=None):
 
 ---
 
-## Step 1 — Select a project (always do this first unless user already specified a projectId)
+## API response format (HAL)
+
+The API returns HAL-format responses. Data is **never** under `items` — always under `_embedded`:
+
+```python
+# Projects
+projects = api("GET", "/v2.0/projects?limit=100")
+all_projects = projects.get("_embedded", {}).get("projects", [])
+
+# Flows
+flows = api("GET", f"/v2.0/flows?projectId={project_id}&limit=100")
+all_flows = flows.get("_embedded", {}).get("flows", [])
+```
+
+Object IDs are extracted from `_links.self.href` (not a top-level `_id`):
+```python
+href = obj.get("_links", {}).get("self", {}).get("href", "")
+obj_id = href.rstrip("/").split("/")[-1]
+```
+
+Flow/project names are nested under `properties`:
+```python
+name = obj.get("properties", obj).get("name", "")
+```
+
+For single-object responses (GET by ID, chart, node), fields are at the top level with a real `_id`.
+
+---
+
+## Step 1 — Select a project
 
 ```python
 projects = api("GET", "/v2.0/projects?limit=100")
-for p in projects["items"]:
-    print(p["_id"], p["name"])
+all_projects = projects.get("_embedded", {}).get("projects", [])
+for p in all_projects:
+    pid = p.get("_links",{}).get("self",{}).get("href","").split("/")[-1]
+    print(pid, p["name"])
 ```
-
-Show the list, ask the user which project to work with. Store the chosen `projectId`.
 
 ---
 
@@ -54,55 +83,67 @@ Show the list, ask the user which project to work with. Store the chosen `projec
 
 ```python
 flows = api("GET", f"/v2.0/flows?projectId={project_id}&limit=100")
-for f in flows["items"]:
-    print(f["_id"], f["name"])
+all_flows = flows.get("_embedded", {}).get("flows", [])
+for f in all_flows:
+    fid = f.get("_links",{}).get("self",{}).get("href","").split("/")[-1]
+    name = f.get("properties", f).get("name", fid)
+    print(fid, name)
 ```
-
-Ask the user which flow to work with. Store `flowId`.
 
 ---
 
-## Step 3 — Read and display flow structure
+## Step 3 — Read flow structure
 
-Fetch all nodes with pagination, then display as an indented tree:
+**Use the chart endpoint** — the paginated nodes endpoint returns `total` but empty items in practice. The chart returns everything at once including the relation graph:
 
 ```python
-nodes, cursor = [], None
-while True:
-    qs = f"?limit=100" + (f"&next={cursor}" if cursor else "")
-    page = api("GET", f"/v2.0/flows/{flow_id}/chart/nodes{qs}")
-    nodes += page["items"]
-    cursor = page.get("nextCursor")
-    if not cursor:
-        break
-
-# Build id→node map and print
-for n in nodes:
-    print(f"[{n['type']}] {n.get('label') or n['type']}  id={n['_id']}"
-          + (f"  ⛔ disabled" if n.get("isDisabled") else "")
-          + (f"  🔵 entry" if n.get("isEntryPoint") else ""))
+chart = api("GET", f"/v2.0/flows/{flow_id}/chart")
+# chart["nodes"]     → list of node objects (each has _id, type, label, referenceId, config, ...)
+# chart["relations"] → list of {node, next, children} — the connection graph
 ```
 
-**Understand the structure:** Cognigy stores ordering implicitly — present nodes grouped by logical sequence. Highlight entry points, disabled nodes, and node types. When the user asks "what does this flow do?", walk through the nodes in order and summarize each node's purpose based on its type and config.
+Build and display as a tree:
+```python
+nodes_by_id = {n["_id"]: n for n in chart["nodes"]}
+rels_by_node = {r["node"]: r for r in chart["relations"]}
+
+# Find roots: nodes nobody points to as "next"
+all_nexts = {r["next"] for r in chart["relations"] if r["next"]}
+roots = set(nodes_by_id) - all_nexts
+
+def print_node(nid, indent=0):
+    n = nodes_by_id.get(nid)
+    if not n: return
+    preview = n.get("preview", "")
+    if isinstance(preview, dict):
+        ptext = preview.get("text") or preview.get("condition", "")
+        if isinstance(ptext, list): ptext = ptext[0] if ptext else ""
+    else:
+        ptext = str(preview)
+    entry = " 🔵" if n.get("isEntryPoint") else ""
+    print("  " * indent + f"[{n['type']}] {n.get('label','')}{entry}  →  {str(ptext)[:80]}")
+    rel = rels_by_node.get(nid, {})
+    for child_id in rel.get("children", []):
+        print_node(child_id, indent + 1)
+    if rel.get("next"):
+        print_node(rel["next"], indent)
+
+for root in roots:
+    print_node(root)
+```
 
 ---
 
-## Step 4 — Fetch node descriptors (do this before creating or editing any node)
+## Step 4 — Fetch node descriptors
 
-Descriptors define what `config` fields every node type accepts:
+**Note: the descriptors endpoint currently returns empty in this environment.** Skip it and instead read an existing node of the same type to learn its config shape:
 
 ```python
-descriptors = api("GET", f"/v2.0/flows/{flow_id}/chart/descriptors")
-# descriptors["items"] → list of descriptor objects
-# Each has: type, extension, defaultLabel, fields (list of {key, type, defaultValue})
-for d in descriptors["items"]:
-    print(d["type"], [f["key"] for f in d.get("fields", [])])
+# Find an existing node of the type you want to create/edit
+existing = next(n for n in chart["nodes"] if n["type"] == "question")
+full = api("GET", f"/v2.0/flows/{flow_id}/chart/nodes/{existing['_id']}")
+print(json.dumps(full.get("config", {}), indent=2))
 ```
-
-Use descriptors to:
-- Know what `config` keys a node type accepts before creating/editing it
-- Show the user what's configurable on a node type they ask about
-- Validate that fields you're setting actually exist on the node type
 
 ---
 
@@ -117,140 +158,124 @@ print(json.dumps(node, indent=2))
 
 ## Step 6 — Create a node
 
-**Required fields:**
-- `type`: node type string (from descriptors)
-- `extension`: extension identifier from descriptor (e.g. `@cognigy/basic-nodes`)
-- `target`: `_id` of the node to attach to
-- `mode`: one of `append`, `prepend`, `appendChild`, `prependChild`, `insertAfter`, `insertBefore`, `insertChildAt`
+**Required fields:** `type`, `extension`, `target` (_id of existing node), `mode`
 
-**Config:** build `config` from the descriptor's `fields` list. Use `defaultValue` as base, then apply user's intent.
+Valid modes: `append`, `prepend`, `appendChild`, `prependChild`, `insertAfter`, `insertChildAt`
+**Do NOT use `insertBefore`** — causes 500 error. Use `append` on the preceding node instead.
 
 ```python
-payload = {
-    "type": "say",
-    "extension": "@cognigy/basic-nodes",
-    "label": "Welcome message",
-    "target": "TARGET_NODE_ID",
-    "mode": "append",
-    "config": {
-        # populated from descriptor fields + user intent
-    }
+def create(label, ntype, target, mode, config=None):
+    payload = {"type": ntype, "extension": "@cognigy/basic-nodes",
+               "label": label, "target": target, "mode": mode}
+    if config: payload["config"] = config
+    r = api("POST", f"/v2.0/flows/{flow_id}/chart/nodes", payload)
+    return r.get("_id") or r.get("_links",{}).get("self",{}).get("href","").split("/")[-1]
+```
+
+### If node behaviour
+
+Creating an `if` node **automatically creates its `then` and `else` children** — do NOT create them manually (400 error). After creating the If, fetch the chart and read `relations[if_id].children` to get their IDs:
+
+```python
+if_id = create("My check", "if", target_id, "append", if_config("context.x === 1"))
+chart = api("GET", f"/v2.0/flows/{flow_id}/chart")
+rels = {r["node"]: r for r in chart["relations"]}
+then_id = rels[if_id]["children"][0]
+else_id = rels[if_id]["children"][1]
+```
+
+### If node config shape
+
+```python
+def if_config(condition_str):
+    return {"condition": {
+        "type": "condition",
+        "rule": {"left": "1", "operand": "eq", "right": "1"},
+        "condition": condition_str
+    }}
+```
+
+### Config shapes for key node types (verified against live API)
+
+**Say** — `text` is always an array:
+```json
+{
+  "say": {"type": "text", "text": ["Hello, {{context.name}}!"]},
+  "handoverOutput": "userAndAgent",
+  "generativeAI_rephraseOutputMode": "none",
+  "generativeAI_amountOfLastUserInputs": 5,
+  "generativeAI_customInputs": "",
+  "generativeAI_temperature": 0.7
 }
-result = api("POST", f"/v2.0/flows/{flow_id}/chart/nodes", payload)
-print("Created:", result["_id"])
+```
+
+**Question** — `type` is the question type, text is in `say.text` (array):
+```json
+{
+  "type": "text",
+  "say": {"type": "text", "text": ["What is your name?"]},
+  "storeResultInContext": true,
+  "contextKey": "userName",
+  "validationMessage": "Not sure I understood that."
+}
+```
+For yes/no questions use `"type": "yesNo"`. Answer is in `input.slots.yesNo[0].keyphrase` (`'yes'` or `'no'`).
+
+**Code** — pure JS, key is `code` (not `script`):
+```json
+{"code": "context.result = context.value * 2;"}
+```
+
+**GoTo** — uses `referenceId` (UUID), NOT `_id`. Get them:
+- Flow referenceId: `GET /v2.0/flows/{flowId}` → `.referenceId`
+- Node referenceId: from `chart["nodes"][i]["referenceId"]`
+
+```json
+{
+  "flowNode": {"flow": "<flow-referenceId>", "node": "<node-referenceId>"},
+  "absorbContext": false,
+  "executionMode": "continue",
+  "injectedText": "",
+  "injectedData": "{}",
+  "parseIntents": false,
+  "parseKeyphrases": false
+}
 ```
 
 ### Code node sandbox restrictions
 
-The Cognigy Code node runs in a heavily restricted JS sandbox. **Not available:** `Buffer`, `btoa`, `atob`, `require`, `crypto`, `fetch`, `XMLHttpRequest`, or any Node.js built-ins. Write pure JS only — no globals beyond standard ECMAScript (Math, String, Array, Object, JSON, etc.).
-
-### Config patterns for the 5 key node types
-
-Fetch the actual shapes from descriptors at runtime — these are starting points:
-
-**Say** — outputs a message to the user
-```json
-{
-  "say": {
-    "type": "text",
-    "text": "Hello!"
-  }
-}
-```
-
-**HTTP Request** — calls an external URL
-```json
-{
-  "method": "GET",
-  "url": "https://example.com/api",
-  "headers": [],
-  "bodyType": "json",
-  "body": {},
-  "responseVar": "httpResult"
-}
-```
-
-**Code** — runs arbitrary JS
-```json
-{
-  "script": "actions.output('Hello from code node', {});"
-}
-```
-
-**Question** — asks the user something and waits for a reply
-```json
-{
-  "questionType": "text",
-  "text": "What is your name?",
-  "repromptOptions": { "enabled": false },
-  "validation": { "enabled": false }
-}
-```
-
-**AddToContext** — stores a value in the conversation context
-```json
-{
-  "key": "myKey",
-  "value": "{{input.text}}"
-}
-```
-
-> Always verify the exact field names against the descriptor before creating. Run Step 4 first.
+**Not available:** `Buffer`, `btoa`, `atob`, `require`, `crypto`, `fetch`, or any Node.js built-ins. Write pure ECMAScript only. If you need base64 or hashing, implement in pure JS.
 
 ---
 
 ## Step 7 — Update a node
 
-PATCH with only the fields you want to change. Always read the node first (Step 5) to avoid overwriting config fields you don't intend to touch.
+Always read the node first, then merge your changes into the full config to avoid wiping fields:
 
 ```python
-payload = {
-    "label": "New label",
-    "config": { ...merged config... }
-}
-result = api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}", payload)
-# 204 = success, no body
+node = api("GET", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
+config = node.get("config", {})
+config["say"]["text"] = ["Updated message"]  # mutate only what you need
+api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}", {"config": config})
+# Returns 204 on success (no body)
 ```
 
 ---
 
-## GoTo node config
-
-GoTo uses `referenceId` (UUID format), NOT `_id`. Get them via:
-- Flow referenceId: `GET /v2.0/flows/{flowId}` → `.referenceId`
-- Node referenceId: from the chart nodes array → `.referenceId`
-
-```python
-{
-    "flowNode": {"flow": "<flow-referenceId>", "node": "<node-referenceId>"},
-    "absorbContext": False,
-    "executionMode": "continue",   # or "once"
-    "injectedText": "",
-    "injectedData": "{}",
-    "parseIntents": False,
-    "parseKeyphrases": False
-}
-```
-
-## If node behaviour
-
-Creating an `if` node automatically creates its `then` and `else` children — do NOT try to create them manually (400 error). Fetch the chart after creating the If to get the auto-created children IDs from `relations[].children`.
-
 ## Step 8 — Move a node
 
 ```python
-payload = {
-    "target": "NEW_PARENT_NODE_ID",
-    "mode": "append"   # same mode options as create
-}
-api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}/move", payload)
+api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}/move", {
+    "target": "NEW_TARGET_NODE_ID",
+    "mode": "append"
+})
 ```
 
 ---
 
 ## Step 9 — Delete a node
 
-Confirm with the user before deleting. Deleting a parent node may remove its children.
+Confirm with the user first. Deleting a parent node may remove its children.
 
 ```python
 api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
@@ -260,9 +285,12 @@ api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
 
 ## Workflow rules
 
-1. **Always fetch descriptors before creating or editing** — never guess `config` shapes.
-2. **Always read a node before updating** — merge changes into existing config, don't replace wholesale.
-3. **Show the flow structure after any mutation** — re-run Step 3 so the user sees the current state.
-4. **Paginate node fetches** — flows can have hundreds of nodes; always follow `nextCursor`.
-5. **Confirm destructive operations** — ask before delete or move.
-6. **When explaining a flow:** walk nodes in order, describe each type in plain language, call out entry points, disabled nodes, and any HTTP/Code nodes (side effects).
+1. **Use the chart endpoint** (`GET /chart`) for reading structure — not the paginated nodes endpoint.
+2. **Always read a node before updating** — merge changes, never replace the whole config.
+3. **Never use `insertBefore`** — use `append` on the preceding node.
+4. **If nodes auto-create Then/Else** — fetch chart after creation to get their IDs.
+5. **GoTo needs referenceId (UUID), not _id** — fetch flow object and chart nodes to get them.
+6. **Say and Question `text` fields are always arrays**, not strings.
+7. **Code node is pure ECMAScript** — no Node.js globals at all.
+8. **Confirm destructive operations** — ask before delete or move.
+9. **After any mutation**, re-fetch and display the chart so the user sees current state.
