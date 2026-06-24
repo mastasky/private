@@ -7,15 +7,30 @@ description: Manage Cognigy.AI Flows via the REST API — read flow structure an
 
 Manage Cognigy.AI Flows: read structure, understand nodes, create/edit/move/delete nodes.
 
-## Constants
+## Constants & environment
+
+The API host is **tenant-specific**. Never hardcode it — read it from the environment:
 
 ```
-BASE_URL = https://api-trial.cognigy.ai/new
+COGNIGY_API_BASE   e.g. https://api-trial.cognigy.ai   (trial)
+                        https://api-app.cognigy.ai      (Cognigy Cloud)
+                        https://api.<your-domain>        (self-hosted / dedicated)
+COGNIGY_API_KEY    your API key (see below)
+COGNIGY_ENDPOINT_BASE  e.g. https://endpoint-trial.cognigy.ai  (for live conversation tests)
 ```
 
-**Always use the `/new` namespace.** All calls go to `https://api-trial.cognigy.ai/new/v2.0/...`. The `/new` prefix is a strict superset of the plain `/v2.0` API — everything that works without it works with it, and some routes (e.g. creating endpoints) **only** work under `/new`. The helper below bakes `/new` into `BASE`, so every `path` you pass starts at `/v2.0/...` and is automatically served from `/new`.
+The helper appends `/new` to whatever base you supply (see Python helper). **Always use the `/new` namespace.** The `/new` prefix is a strict superset of the plain `/v2.0` API — everything that works without it works with it, and some routes (e.g. creating endpoints) **only** work under `/new`. So every `path` you pass starts at `/v2.0/...` and is automatically served from `/new`.
 
-All requests use header: `X-API-Key: <API_KEY>`
+All requests use header: `X-API-Key: <API_KEY>`.
+
+### Version-sensitivity warning
+
+This guide was reverse-engineered and **verified against a Cognigy.AI trial tenant** (see "verified live" notes throughout). Cognigy's REST surface and runtime field names change between releases, and several items here are undocumented or are trial-environment quirks. Before relying on this in production:
+- **Pin the Cognigy version** you target and re-verify the items tagged ⚠️ TRIAL-QUIRK below against it.
+- Treat anything marked "discovered live / not in the docs" as **version-sensitive** — re-test after Cognigy upgrades.
+- Resource `referenceId`s (LLM providers, personas, locales, flows) are **per-tenant**; resolve them at runtime, never hardcode the trial values shown in examples.
+
+⚠️ **TRIAL-QUIRK** (re-verify on your version — may not reproduce): the node *descriptors* endpoint returns empty; `GET /v2.0/aiagents` (list) returns 500; the paginated *nodes* endpoint returns `total` but empty items; the node `/move` route (Step 8) returned 404. The workarounds below assume these quirks; if your version behaves correctly, prefer the documented endpoints.
 
 ### Getting the API key
 
@@ -32,27 +47,42 @@ Keep the key in memory for the session only — never write it to `SKILL.md`, co
 
 All API calls use this pattern — write to `/tmp/cognigy_op.py` then run it.
 
-Pass the key via the environment, never inline. Run the script as:
-`COGNIGY_API_KEY="<key the user gave you>" python3 /tmp/cognigy_op.py`
+Pass the key and host via the environment, never inline. Run the script as:
+`COGNIGY_API_BASE="https://api-trial.cognigy.ai" COGNIGY_API_KEY="<key>" python3 /tmp/cognigy_op.py`
+
+The helper reads both from the environment and appends `/new`. It retries idempotent calls on transient errors and surfaces (rather than swallows) failures so callers can handle them.
 
 ```python
-import json, os, urllib.request, urllib.error, sys
+import json, os, time, urllib.request, urllib.error, sys
 
-BASE = "https://api-trial.cognigy.ai/new"   # always use the /new namespace
-KEY  = os.environ["COGNIGY_API_KEY"]   # ask the user for this; do not hardcode
+# Host is tenant-specific — read from env, default to trial only as a convenience.
+BASE = os.environ.get("COGNIGY_API_BASE", "https://api-trial.cognigy.ai").rstrip("/") + "/new"
+KEY  = os.environ["COGNIGY_API_KEY"]   # never hardcode; see "Getting the API key"
 HEADERS = {"X-API-Key": KEY, "Content-Type": "application/json"}
 
-def api(method, path, body=None):
+class CognigyError(Exception):
+    def __init__(self, code, body): self.code, self.body = code, body; super().__init__(f"HTTP {code}: {body}")
+
+def api(method, path, body=None, retries=3):
     url = BASE + path
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read().decode()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        print(f"HTTP {e.code}: {e.read().decode()}", file=sys.stderr); sys.exit(1)
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            # Retry only safe/transient cases; surface everything else.
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(2 ** attempt); continue
+            raise CognigyError(e.code, e.read().decode())
+        except urllib.error.URLError:
+            if attempt < retries: time.sleep(2 ** attempt); continue
+            raise
 ```
+
+> In an interactive Claude Code session it's fine to let exceptions print and stop. In product code, catch `CognigyError` and handle per status (401 → bad key, 404 → missing resource, 409 → name conflict, etc.).
 
 ---
 
@@ -291,7 +321,7 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
 ```
 
 **AI Agent** (`aiAgentJob`) — an LLM-driven conversational agent. Extension is `@cognigy/basic-nodes` like the others. The persona is defined **inline** via `name` / `description` / `instructions`; two reference fields link shared project resources:
-- `llmProviderReferenceId` — a Large Language Model resource. List them: `GET /v2.0/largelanguagemodels?projectId={projectId}` (returns `referenceId` + `name` + model). gpt-4o works well: `86e64e87-9c22-4013-98a9-219d8ec978d0` in this trial.
+- `llmProviderReferenceId` — a Large Language Model resource. **Resolve it at runtime per tenant — never hardcode** (the IDs differ in every tenant): `GET /v2.0/largelanguagemodels?projectId={projectId}` returns `referenceId` + `name` + model; pick the one you want by name/model. (For reference, in the trial tenant a gpt-4o model had `referenceId` `86e64e87-9c22-4013-98a9-219d8ec978d0` — illustrative only, do not reuse.)
 - `aiAgent` — an AI Agent resource (persona) referenceId. **Prefer creating a dedicated persona per agent** rather than borrowing one — it's cheap and keeps voice/identity/safety config separate.
 
 **Creating a persona (AI Agent resource):** `POST /v2.0/aiagents` needs only `projectId` + `name` (201). The resource holds identity/delivery config — `image`, `speakingStyle`, `voiceConfigs` / `enableVoiceConfigs`, `safetySettings`, `enableAutoLanguageDetection`, `contactProfilesOption` — **not** the prompt: `description`/`instructions` stay inline on the node. Use the returned `referenceId` as the node's `aiAgent`.
@@ -306,11 +336,13 @@ agent_ref, agent_id = agent["referenceId"], agent["_id"]   # ref → config["aiA
 # delete:        api("DELETE", f"/v2.0/aiagents/{agent_id}")
 ```
 
-Caveats — **save the `_id` at creation time**: the `GET /v2.0/aiagents` **list** endpoint 500s in this trial (under `/new` too — it's a trial bug, not a namespace issue), the single-GET/PATCH/DELETE require the mongo `_id`, and there is **no referenceId→`_id` lookup**. If you only have a persona's `referenceId` (e.g. copied from a node), you cannot edit or delete that persona via the API — you'd have to recreate it (names must be unique, so a duplicate name 409s) or fix it in the UI. So: capture `_id` when you create, and reuse one persona across flows rather than orphaning duplicates.
+Caveats — **save the `_id` at creation time**: ⚠️ TRIAL-QUIRK the `GET /v2.0/aiagents` **list** endpoint 500s in this trial (under `/new` too — appears to be a trial bug, not a namespace issue; re-verify on your version). The single-GET/PATCH/DELETE require the mongo `_id`, and there is **no referenceId→`_id` lookup**. If you only have a persona's `referenceId` (e.g. copied from a node), you cannot edit or delete that persona via the API — you'd have to recreate it (names must be unique, so a duplicate name 409s) or fix it in the UI. So: capture `_id` when you create, and reuse one persona across flows rather than orphaning duplicates.
+
+**`aiAgentJob` node config** (this is the *node* config, distinct from the persona resource above — `description`/`instructions` live here on the node, identity/voice live on the persona resource):
 
 ```json
 {
-  "aiAgent": "<aiAgent-referenceId copied from an existing node>",
+  "aiAgent": "<aiAgent-referenceId from the persona you created>",
   "llmProviderReferenceId": "<llm referenceId>",
   "name": "Candy Salesman",
   "description": "Short summary of who the agent is.",
@@ -413,7 +445,10 @@ This is the mechanism behind the "disable external calls" scaffolding pattern be
 
 ## Step 8 — Move a node
 
+⚠️ **TRIAL-QUIRK — verify before relying on this.** The `/move` route below returned **404** in the trial tenant. It may be version-specific or removed. Re-test on your Cognigy version; if it 404s, **don't move — delete and recreate**: read the node's config, `DELETE` it, then `create(...)` at the new position with the saved config (this is the reliable fallback used elsewhere in this guide).
+
 ```python
+# May 404 depending on Cognigy version — see warning above.
 api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}/move", {
     "target": "NEW_TARGET_NODE_ID",
     "mode": "append"
@@ -443,6 +478,7 @@ FORBIDDEN = ["Buffer", "btoa", "atob", "require(", "crypto", "fetch(", "XMLHttpR
 def lint(flow_id):
     chart = api("GET", f"/v2.0/flows/{flow_id}/chart")
     ref_ids = {n.get("referenceId") for n in chart["nodes"]}
+    has_agent = any(n.get("type") == "aiAgentJob" for n in chart["nodes"])  # gate the agent-only rule
     issues = []
     for n in chart["nodes"]:
         t, label = n.get("type"), n.get("label") or n.get("type")
@@ -468,9 +504,10 @@ def lint(flow_id):
         # WARN: Say node missing preventTranscript
         if t == "say" and "preventTranscript" not in cfg:
             issues.append(("WARN", label, "Say node missing preventTranscript"))
-        # ERROR: Question or GoTo in a flow that contains an AI Agent
-        if t in ("question", "goTo"):
-            issues.append(("ERROR", label, f"{t} node is not allowed in AI Agent flows"))
+        # ERROR: Question or GoTo only inside a flow that ALSO contains an AI Agent.
+        # (Question + GoTo are perfectly valid in deterministic flows — only flag when an agent is present.)
+        if has_agent and t in ("question", "goTo"):
+            issues.append(("ERROR", label, f"{t} node is not allowed in a flow containing an AI Agent"))
         # INFO: disabled node still sitting in the flow
         if n.get("isDisabled"):
             issues.append(("INFO", label, "node is disabled"))
@@ -585,9 +622,11 @@ If they don't match, STOP and tell the user the endpoint points at a different f
 ### Then drive the conversation
 
 ```python
-import json, uuid, urllib.request, time
+import json, os, uuid, urllib.request, time
 
-URL = "https://endpoint-trial.cognigy.ai/<token>"
+# Endpoint host is tenant-specific — read from env (e.g. https://endpoint-trial.cognigy.ai).
+EP_BASE = os.environ.get("COGNIGY_ENDPOINT_BASE", "https://endpoint-trial.cognigy.ai").rstrip("/")
+URL = f"{EP_BASE}/<token>"
 session = str(uuid.uuid4())   # one session = one conversation thread
 
 def send(text):
@@ -617,6 +656,18 @@ When a flow needs to call a real external API (HTTP Request node) that doesn't e
 2. Immediately after it, add a **Code node placeholder** that writes the response the HTTP node *would* have returned into context, e.g. `context.blockResult = {status: 'blocked', reference: 'MOCK-REF-12345'};`. Downstream nodes read from context and behave identically to the live path.
 
 This keeps the flow runnable and verifiable now; going live later is just enabling the HTTP node and deleting the placeholder. Default to this whenever you scaffold a flow that touches an external system you can't safely call during the build.
+
+## Productionizing checklist
+
+This guide doubles as a field reference and an agent runbook. Before depending on it in product code:
+
+1. **Configuration, not constants.** Source `COGNIGY_API_BASE`, `COGNIGY_API_KEY`, and `COGNIGY_ENDPOINT_BASE` from your secrets/config system. No trial hosts, keys, or `referenceId`s in code or VCS.
+2. **Resolve all resource IDs at runtime** per tenant/project — LLM providers (`/largelanguagemodels`), personas (`/aiagents`), locales (`/locales`), flows (`/flows`). The trial UUIDs in examples are illustrative only.
+3. **Pin the Cognigy version** and re-verify every item tagged ⚠️ TRIAL-QUIRK and every "discovered live / not in the docs" behavior against it. Add a regression test that drives a known flow end-to-end (see "Verifying a flow") so a Cognigy upgrade that changes a field name fails loudly.
+4. **Error handling:** catch `CognigyError` and branch on status (401/403 auth, 404 missing, 409 conflict, 429 rate-limit). Don't `sys.exit` in a service.
+5. **Pagination:** every list call (`/projects`, `/flows`, `/endpoints`, `/locales`, `/aiagents`) is paginated — loop on `skip`/`limit`, don't assume `limit=100` covers it.
+6. **Idempotency & concurrency:** names must be unique (duplicate create → 409); chart mutations are not transactional, so on multi-node builds, verify the chart after each step and make your builder re-runnable (skip-if-exists) rather than assuming a clean slate.
+7. **Never hardcode secrets**, never log the API key, and scrub it from any captured request/response.
 
 ## Workflow rules
 
