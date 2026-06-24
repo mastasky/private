@@ -140,6 +140,10 @@ result = api("POST", f"/v2.0/flows/{flow_id}/chart/nodes", payload)
 print("Created:", result["_id"])
 ```
 
+### Code node sandbox restrictions
+
+The Cognigy Code node runs in a heavily restricted JS sandbox. **Not available:** `Buffer`, `btoa`, `atob`, `require`, `crypto`, `fetch`, `XMLHttpRequest`, or any Node.js built-ins. Write pure JS only — no globals beyond standard ECMAScript (Math, String, Array, Object, JSON, etc.).
+
 ### Config patterns for the 5 key node types
 
 Fetch the actual shapes from descriptors at runtime — these are starting points:
