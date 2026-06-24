@@ -270,7 +270,17 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
 
 **AI Agent** (`aiAgentJob`) — an LLM-driven conversational agent. Extension is `@cognigy/basic-nodes` like the others. The persona is defined **inline** via `name` / `description` / `instructions`; two reference fields link shared project resources:
 - `llmProviderReferenceId` — a Large Language Model resource. List them: `GET /v2.0/largelanguagemodels?projectId={projectId}` (returns `referenceId` + `name` + model). gpt-4o works well: `86e64e87-9c22-4013-98a9-219d8ec978d0` in this trial.
-- `aiAgent` — an AI Agent resource referenceId. The `GET /v2.0/aiagents` list endpoint 500s in this trial and the single-GET wants a mongo-id, so the practical way to obtain a valid `aiAgent` referenceId is to **copy it from an existing AI Agent node** (read another flow's `aiAgentJob` config). Reusing one across flows in the same project works fine; the persona still comes from the inline fields, not the referenced resource.
+- `aiAgent` — an AI Agent resource (persona) referenceId. **Prefer creating a dedicated persona per agent** rather than borrowing one — it's cheap and keeps voice/identity/safety config separate.
+
+**Creating a persona (AI Agent resource):** `POST /v2.0/aiagents` needs only `projectId` + `name` (201). The resource holds identity/delivery config — `speakingStyle`, `voiceConfigs` / `enableVoiceConfigs`, `safetySettings`, `enableAutoLanguageDetection`, `contactProfilesOption` — **not** the prompt: `description`/`instructions` stay inline on the node. Use the returned `referenceId` as the node's `aiAgent`.
+
+```python
+agent = api("POST", "/v2.0/aiagents", {"projectId": project_id, "name": "Mr. Sweet"})
+agent_ref = agent["referenceId"]          # use as config["aiAgent"]
+# delete with the mongo _id (not the referenceId): DELETE /v2.0/aiagents/{agent["_id"]}
+```
+
+Caveats: the `GET /v2.0/aiagents` **list** endpoint 500s in this trial and the single-GET wants a mongo-id — so to discover an *existing* persona's referenceId, copy it from an existing `aiAgentJob` node's config. Creating a fresh one (above) sidesteps both. Reusing one persona across flows in the same project is also fine.
 
 ```json
 {
@@ -291,6 +301,29 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
 **Auto-created children (like If→then/else):** creating an `aiAgentJob` auto-spawns an `aiAgentJobDefault` ("Default", the path taken when the agent just replies) and one `aiAgentJobTool` ("Tool") child. Do not create them manually. For a **pure conversational agent with no tools, delete the empty Tool node** (`DELETE .../chart/nodes/{toolId}`) — an unconfigured tool is dead weight. To give the agent a tool, configure that `aiAgentJobTool` instead: it has `toolId`, `description`, and a JSON-schema `parameters` string; the agent calls it by name and execution flows into the tool's children. Set `knowledgeSearchBehavior: "always"` to attach knowledge-store search.
 
 `storeLocation: "stream"` + `outputImmediately: true` streams the reply straight to the user (no Say node needed). The full result is also stored at `input.aiAgentOutput` / `context.aiAgentOutput`.
+
+### Voice bots — Set Session Config node
+
+For **voice bots**, place a **Set Session Config** node (`type: "setSessionConfig"`, extension **`@cognigy/voicegateway2`**) **in front of the AI Agent node**. It configures the Voice Gateway (speech-to-text, text-to-speech, barge-in, timeouts, DTMF) for the session before the agent speaks. Create it like any node (`append` on the start node, then append the AI Agent after it). Build voice flows as: `start → setSessionConfig → aiAgentJob`.
+
+Key config options (full set verified live; all optional — defaults shown are sane):
+- **TTS (how the bot speaks):** `ttsVendor` (`"none"` = inherit endpoint default, else e.g. `"google"`/`"elevenlabs"`/`"azure"`), `ttsVoice`, `ttsLanguage`, `ttsModel`, `ttsDisableCache`.
+- **STT (how it hears):** `sttVendor`, `sttLanguage`, `sttModel`, `sttHints` (array of bias phrases), `sttDisablePunctuation`, `googleModel` (e.g. `"latest_short"`). Azure/Google multi-language recognition via `recognizeLanguagesAzure`/`recognizeLanguagesGoogle` + `stt*Lang1..3`.
+- **Barge-in (caller interrupts the bot):** `bargeInOnSpeech` (bool), `bargeInMinWordCount` (e.g. `2`), `bargeInOnDtmf`.
+- **Endpointing (when a turn ends):** `deepgramEndpointing` + `deepgramEndpointingValue` (ms, e.g. `250`), `sttVadEnabled`, `sttVadMode`, `sttVadVoiceMs`.
+- **No-input handling:** `userNoInputTimeoutEnable`, `userNoInputTimeout` (ms), `userNoInputRetries`, `userNoInputMode` (`"event"`/`"play"`), `userNoInputSpeech`/`userNoInputUrl`; flow-level equivalents `flowNoInput*`.
+- **DTMF (keypad):** `dtmfEnable`, `dtmfMaxDigits`/`dtmfMinDigits`, `dtmfInterDigitTimeout`, `dtmfSubmitDigit` (e.g. `"#"`).
+- **Ambience/overlay:** `atmosphereUrl`/`atmosphereVolume`/`atmosphereLoop`, `silenceOverlayURL`/`silenceOverlayDelay`.
+- **Raw passthrough:** `sessionParams` (JSON string) for vendor params not exposed as fields.
+
+Minimal voice-friendly config (let the endpoint's defaults stand, just enable barge-in + no-input recovery):
+```json
+{"ttsVendor": "none", "sttVendor": "none", "bargeInOnSpeech": true, "bargeInMinWordCount": 2,
+ "userNoInputTimeoutEnable": true, "userNoInputTimeout": 10000, "userNoInputRetries": 1,
+ "userNoInputMode": "event", "deepgramEndpointing": true, "deepgramEndpointingValue": 250,
+ "sessionParams": "{}"}
+```
+`"none"` for `sttVendor`/`ttsVendor` means "use whatever the voice endpoint is already configured with" — safe default when you don't need to override the voice.
 
 ### Code node sandbox restrictions
 
@@ -541,4 +574,6 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 14. **Scaffold external calls disabled + a placeholder Code node behind them** so the flow is testable without firing live APIs.
 15. **Create endpoints at `POST /new/v2.0/endpoints`** (plain `/v2.0/endpoints` returns 500); `localeId` is the primary locale's `referenceId` UUID.
 16. **Create flows with `POST /v2.0/flows` (projectId + name only)** — no `localeId`. They come with start/end nodes already.
-17. **AI Agent (`aiAgentJob`) persona is inline** (`name`/`description`/`instructions`); copy a valid `aiAgent` referenceId from an existing node (the list endpoint 500s). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
+17. **AI Agent (`aiAgentJob`) prompt is inline** (`name`/`description`/`instructions`). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
+18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
+19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
