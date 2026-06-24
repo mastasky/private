@@ -208,6 +208,20 @@ then_id = rels[if_id]["children"][0]
 else_id = rels[if_id]["children"][1]
 ```
 
+**CRITICAL — how to attach branch body nodes (verified live).** The `then`/`else` nodes are just connector anchors. The body of each branch chains off the **`next`** of the then/else node, NOT as a child of it. So to put a node in the `then` branch, create it with `mode: "append"` and `target=then_id` (this sets `then.next → yourNode`). Do **NOT** use `appendChild`/`prependChild` on the then/else node — that nests the node *inside* the then/else as a child and the runtime does not execute it as the branch body.
+
+```python
+# RIGHT — body hangs off then.next / else.next:
+code_id = create("Set flag", "code", then_id, "append", code_cfg)   # then.next → Code
+create("Go to agent", "goTo", code_id, "append", goto_cfg)          # Code.next → GoTo
+create("Decline",     "say",  else_id, "append", say_cfg)           # else.next → Say
+
+# WRONG — appendChild nests it as a child of then; it won't run as the branch body:
+# create("Set flag", "code", then_id, "appendChild", code_cfg)
+```
+
+Confirm in the chart: `relations[then_id].next` should point at your first body node, and `relations[then_id].children` should be empty. Chain further nodes with `append` on the previous body node. (An If branch falls through to the If's own `next` after the branch body runs, unless a blocking node — Question, AI Agent — ends the turn inside the branch.)
+
 ### If node config shape
 
 ```python
@@ -221,11 +235,11 @@ def if_config(condition_str):
 
 ### Config shapes for key node types (verified against live API)
 
-**Say** — `text` is always an array. **Always set `excludeFromTranscript: true`** — every Say node must include this to prevent its output from polluting the transcript:
+**Say** — `text` is always an array. **Always set `preventTranscript: true`** — every Say node must include this to prevent its output from polluting the transcript. (The field is `preventTranscript`, NOT `excludeFromTranscript` — the latter is rejected with HTTP 400 "Invalid field". Note: `preventTranscript: true` also suppresses the Say's REST output when the Say sits at the **end** of a branch with no blocking node after it — if you need the user to actually see a terminal message like a decline, set `preventTranscript: false` on that Say.)
 ```json
 {
   "say": {"type": "text", "text": ["Hello, {{context.name}}!"]},
-  "excludeFromTranscript": true,
+  "preventTranscript": true,
   "handoverOutput": "userAndAgent",
   "generativeAI_rephraseOutputMode": "none",
   "generativeAI_amountOfLastUserInputs": 5,
@@ -331,7 +345,7 @@ aiAgentJobTool ──next──> <your handler nodes> ──next──> aiAgentT
    `parameters` is a **JSON-schema string** (stringify it). `toolId` is the function name the model calls. `condition` (optional CognigyScript) gates whether the tool is offered.
 2. **Build the handler branch** by appending nodes to the tool node (`target`=tool `_id`, `mode: "append"`): do the work (Code/HTTP/etc.), then end the branch with an **`aiAgentToolAnswer`** node ("Resolve Tool Action").
 3. **Read the call arguments at `input.aiAgent.toolArgs.<paramName>`** — e.g. `input.aiAgent.toolArgs.candy`. (Discovered live; not in the docs.)
-4. **Return the result** via `aiAgentToolAnswer` config `{"answer": "...", "debugToolAnswer": false}`. The `answer` string supports CognigyScript (`{{context.x}}`) and is fed **back to the LLM**, which then phrases the user-facing reply — so make it factual ("A bag of {{context.candyName}} costs ${{context.candyPrice}}."), not a finished sentence.
+4. **Return the result** via `aiAgentToolAnswer` config `{"answer": "...", "debugToolAnswer": false}`. The `answer` string supports simple CognigyScript interpolation (`{{context.x}}`) and is fed **back to the LLM**, which then phrases the user-facing reply — so make it factual ("A bag of {{context.candyName}} costs ${{context.candyPrice}}."), not a finished sentence. **Handlebars block helpers (`{{#if}}`, `{{#each}}`) do NOT render here** — a `{{#if context.x.success}}...{{else}}...{{/if}}` answer silently produces nothing, the LLM gets an empty result and reports failure. For any conditional answer, build the whole string in the preceding Code node (`context.toolMessage = success ? "..." : "..."`) and set the answer to a plain `{{context.toolMessage}}`.
 
 **Forcing tool use:** `toolChoice: "auto"` lets the model decide — and it will happily answer from its own knowledge instead of calling the tool. If the tool must run (e.g. real prices, not hallucinated ones), say so explicitly in `instructions`: *"For ANY price question you MUST call get_candy_price; never guess a price."*
 
@@ -446,9 +460,9 @@ def lint(flow_id):
             txt = cfg.get("say", {}).get("text", [])
             if not txt or not any((s or "").strip() for s in txt):
                 issues.append(("WARN", label, f"{t} has empty text"))
-        # WARN: Say node missing excludeFromTranscript
-        if t == "say" and not cfg.get("excludeFromTranscript"):
-            issues.append(("WARN", label, "Say node missing excludeFromTranscript: true"))
+        # WARN: Say node missing preventTranscript
+        if t == "say" and "preventTranscript" not in cfg:
+            issues.append(("WARN", label, "Say node missing preventTranscript"))
         # ERROR: Question or GoTo in a flow that contains an AI Agent
         if t in ("question", "goTo"):
             issues.append(("ERROR", label, f"{t} node is not allowed in AI Agent flows"))
@@ -622,4 +636,6 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
 20. **Tools:** add an `aiAgentJobTool` child to the agent, build its handler branch ending in `aiAgentToolAnswer`. Args arrive at `input.aiAgent.toolArgs.<param>`; the answer is fed back to the LLM. Force usage via `instructions` since `toolChoice: "auto"` lets the model skip it.
 21. **No Question or GoTo nodes in tool-assisted / AI Agent flows.** These node types are incompatible with the AI Agent conversation model — use Code, HTTP Request, If, and aiAgentToolAnswer instead.
-22. **All Say nodes must set `excludeFromTranscript: true`.** Always include this field in the Say config to prevent Say output from being added to the conversation transcript.
+22. **All Say nodes must set `preventTranscript`.** Use `preventTranscript: true` to keep output out of the transcript; set it to `false` on a terminal branch message the user must actually see (a terminal `preventTranscript: true` Say is silent in the REST response). The field is `preventTranscript`, never `excludeFromTranscript` (HTTP 400).
+23. **`aiAgentToolAnswer` does NOT render Handlebars block helpers** (`{{#if}}`/`{{#each}}`). Only simple `{{context.x}}` interpolation works; a `{{#if}}` block silently yields nothing, so the LLM receives an answerless result and assumes failure. Build the full answer string in a Code node (e.g. `context.toolMessage = ...`) and set the answer to a plain `{{context.toolMessage}}`.
+24. **Cross-flow `goTo` uses `executionMode: "continue"`**, which runs the target flow inline and (for REST endpoints) flows straight into the agent in the same turn. Because a REST endpoint always re-enters its bound flow's start node every turn, gate multi-turn routing with a *router If at the top of the entry flow* that checks a **`profile`** flag (e.g. `profile.aiConsent === true`) — `context` does not reliably persist across REST turns, `profile` does. Set the flag in a Code node (`profile.aiConsent = true;`) on the consenting branch.
