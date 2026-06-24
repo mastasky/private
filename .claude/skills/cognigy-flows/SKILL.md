@@ -298,6 +298,86 @@ api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
 
 ---
 
+## Step 10 — Lint / health-check a flow
+
+Scan every node for the failure classes that bite in production. Fetch the chart once, then the full config per node, and report findings grouped by severity.
+
+```python
+import re
+FORBIDDEN = ["Buffer", "btoa", "atob", "require(", "crypto", "fetch(", "XMLHttpRequest"]
+
+def lint(flow_id):
+    chart = api("GET", f"/v2.0/flows/{flow_id}/chart")
+    ref_ids = {n.get("referenceId") for n in chart["nodes"]}
+    issues = []
+    for n in chart["nodes"]:
+        t, label = n.get("type"), n.get("label") or n.get("type")
+        cfg = api("GET", f"/v2.0/flows/{flow_id}/chart/nodes/{n['_id']}").get("config", {})
+        # ERROR: node flagged broken by Cognigy itself
+        if cfg.get("hasError") is True:
+            issues.append(("ERROR", label, "node config has hasError=true"))
+        # ERROR: Code node uses a global the sandbox doesn't provide
+        if t == "code":
+            for bad in FORBIDDEN:
+                if bad in cfg.get("code", ""):
+                    issues.append(("ERROR", label, f"Code uses forbidden global: {bad.rstrip('(')}"))
+        # ERROR: GoTo points at a node that no longer exists in this flow
+        if t == "goTo":
+            tgt = cfg.get("flowNode", {})
+            if tgt.get("flow") == chart.get("referenceId") and tgt.get("node") not in ref_ids:
+                issues.append(("ERROR", label, "GoTo target node not found in this flow"))
+        # WARN: Say/Question with no text
+        if t in ("say", "question"):
+            txt = cfg.get("say", {}).get("text", [])
+            if not txt or not any((s or "").strip() for s in txt):
+                issues.append(("WARN", label, f"{t} has empty text"))
+        # INFO: disabled node still sitting in the flow
+        if n.get("isDisabled"):
+            issues.append(("INFO", label, "node is disabled"))
+    return issues
+```
+
+Checks (verified live): `hasError` flag · forbidden Code globals · dangling same-flow GoTo targets · empty Say/Question text · disabled nodes. Extend the list as new failure modes are discovered — keep each check grounded in something reliably present in `config`.
+
+---
+
+## Step 11 — Search across flows in a project
+
+"Where is X used?" before changing a shared variable, URL, or sub-flow.
+
+**Cost matters.** Fetching full config for every node in every flow is thousands of requests and will time out on a large project (~42 flows timed out at 2 min). Two tiers:
+
+- **Fast (default):** search each flow's chart JSON — covers `label`, `comment`, `preview` (which holds Say/Question text and If conditions). **One request per flow.** Use for finding text, labels, conditions, node types.
+- **Deep (scope by node type):** only when you must match inside full `config` (e.g. Code contents, HTTP URLs). Search **only** nodes of the given type — never all nodes — or it's both slow and noisy with false positives.
+
+```python
+def search_project(project_id, pattern, node_type=None):
+    rx = re.compile(pattern, re.IGNORECASE)
+    flows = api("GET", f"/v2.0/flows?projectId={project_id}&limit=100")
+    hits = []
+    for f in flows.get("_embedded", {}).get("flows", []):
+        fid = f.get("_links",{}).get("self",{}).get("href","").rstrip("/").split("/")[-1]
+        fname = f.get("properties", f).get("name", fid)
+        chart = api("GET", f"/v2.0/flows/{fid}/chart")
+        if not chart or "nodes" not in chart: continue
+        for n in chart["nodes"]:
+            if node_type:                       # DEEP: only the target type, full config
+                if n.get("type") != node_type: continue
+                cfg = api("GET", f"/v2.0/flows/{fid}/chart/nodes/{n['_id']}")
+                blob = json.dumps((cfg or {}).get("config", {}))
+            else:                               # FAST: chart-level fields only
+                blob = json.dumps({k: n.get(k) for k in ("label","comment","preview","type")})
+            m = rx.search(blob)
+            if m:
+                ctx = blob[max(0, m.start()-25):m.end()+25]
+                hits.append((fname, n.get("type"), n.get("label") or n.get("type"), ctx))
+    return hits
+```
+
+> Pitfall (hit live): in deep mode, do NOT also chart-match other node types — base64 image data in `aiAgentJob` nodes matched `/sha1/i` by coincidence while the real Code-node match was buried. Restricting deep search to the target type gives exactly the right hit.
+
+---
+
 ## Verifying a flow by talking to it (end-to-end test)
 
 If the flow is connected to a REST/webhook endpoint (e.g. `https://endpoint-trial.cognigy.ai/<token>`), you can drive a real conversation to verify your changes actually work — not just that the API accepted them. This is the strongest verification.
