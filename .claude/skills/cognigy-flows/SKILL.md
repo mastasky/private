@@ -214,6 +214,28 @@ result = api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}", payload)
 
 ---
 
+## GoTo node config
+
+GoTo uses `referenceId` (UUID format), NOT `_id`. Get them via:
+- Flow referenceId: `GET /v2.0/flows/{flowId}` → `.referenceId`
+- Node referenceId: from the chart nodes array → `.referenceId`
+
+```python
+{
+    "flowNode": {"flow": "<flow-referenceId>", "node": "<node-referenceId>"},
+    "absorbContext": False,
+    "executionMode": "continue",   # or "once"
+    "injectedText": "",
+    "injectedData": "{}",
+    "parseIntents": False,
+    "parseKeyphrases": False
+}
+```
+
+## If node behaviour
+
+Creating an `if` node automatically creates its `then` and `else` children — do NOT try to create them manually (400 error). Fetch the chart after creating the If to get the auto-created children IDs from `relations[].children`.
+
 ## Step 8 — Move a node
 
 ```python
