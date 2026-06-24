@@ -117,6 +117,8 @@ For single-object responses (GET by ID, chart, node), fields are at the top leve
 
 ## Step 1 — Select a project
 
+**Always confirm which project to use before creating or modifying anything.** A tenant usually has many projects, and building in the wrong one is hard to undo. List the projects and **ask the user to pick** — never silently default to the first one (`projects[0]`) or guess from the name. Only skip the question if the user already named the project unambiguously in the conversation.
+
 ```python
 projects = api("GET", "/v2.0/projects?limit=100")
 all_projects = projects.get("_embedded", {}).get("projects", [])
@@ -124,6 +126,8 @@ for p in all_projects:
     pid = p.get("_links",{}).get("self",{}).get("href","").split("/")[-1]
     print(pid, p["name"])
 ```
+
+Likewise, **resolve and verify the LLM before building an AI Agent** (see the AI Agent section): `GET /v2.0/largelanguagemodels?projectId={projectId}`. If that list is **empty**, the project has no LLM configured — an `aiAgentJob` node will accept any `llmProviderReferenceId` you pass but return **empty output instantly** at runtime (no error). Stop and ask the user to configure/select an LLM rather than reusing an ID from another tenant or project; referenceIds are not portable across projects.
 
 ---
 
@@ -687,6 +691,7 @@ This guide doubles as a field reference and an agent runbook. Before depending o
 14. **Scaffold external calls disabled + a placeholder Code node behind them** so the flow is testable without firing live APIs.
 15. **Always use the `/new` namespace** — `BASE` ends in `/new`, so paths start at `/v2.0/...`. Endpoint creation (`/v2.0/endpoints`) only works under `/new`; without it you get 500. `localeId` for endpoint creation is the primary locale's `referenceId` UUID.
 16. **Create flows with `POST /v2.0/flows` (projectId + name only)** — no `localeId`. They come with start/end nodes already.
+16a. **Always ask which project to build in** unless the user named it unambiguously — never default to `projects[0]`. And **verify the project has an LLM** (`/largelanguagemodels`) before adding an AI Agent: an empty list means the agent will silently return empty output. Don't reuse an `llmProviderReferenceId` from another project — referenceIds aren't portable.
 17. **AI Agent (`aiAgentJob`) prompt is inline** (`name`/`description`/`instructions`). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
 18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
 19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
