@@ -275,6 +275,16 @@ api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}", {"config": config})
 # Returns 204 on success (no body)
 ```
 
+### Disabling / enabling a node
+
+`isDisabled` is a **top-level node field**, not part of `config`. A disabled node stays in the flow (and in the chart) but is skipped at runtime. Toggle it with a PATCH at the node root:
+
+```python
+api("PATCH", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}", {"isDisabled": True})
+```
+
+This is the mechanism behind the "disable external calls" scaffolding pattern below. The Step 10 lint flags disabled nodes as INFO so they aren't forgotten.
+
 ---
 
 ## Step 8 — Move a node
@@ -469,6 +479,15 @@ Notes:
 - **Test every branch** of any logic you added (yes/no, condition true/false) with separate sessions.
 - **Debugging a condition that won't fire:** temporarily echo the runtime value (e.g. `{{input.result}}`) in a downstream Say node, run one turn to read it, then restore. This is how you discover exact field shapes the API doesn't document.
 
+## Pattern: safe external-call scaffolding
+
+When a flow needs to call a real external API (HTTP Request node) that doesn't exist yet, isn't safe to hit, or has no credentials, build it so it's testable end-to-end without making the live call:
+
+1. Create the **HTTP Request node** with the real method/URL/body, then **disable it** (`{"isDisabled": True}`). It documents intent without firing.
+2. Immediately after it, add a **Code node placeholder** that writes the response the HTTP node *would* have returned into context, e.g. `context.blockResult = {status: 'blocked', reference: 'MOCK-REF-12345'};`. Downstream nodes read from context and behave identically to the live path.
+
+This keeps the flow runnable and verifiable now; going live later is just enabling the HTTP node and deleting the placeholder. Default to this whenever you scaffold a flow that touches an external system you can't safely call during the build.
+
 ## Workflow rules
 
 1. **Use the chart endpoint** (`GET /chart`) for reading structure — not the paginated nodes endpoint.
@@ -483,3 +502,6 @@ Notes:
 10. **After any mutation**, re-fetch and display the chart so the user sees current state.
 11. **Verify behaviour, not just acceptance** — if an endpoint is available, drive a real conversation through every branch before declaring done.
 12. **Confirm the endpoint routes to your flow before testing** — match the endpoint's `flowId` (a referenceId) to the flow's `referenceId`. Never report results from an endpoint you haven't confirmed.
+13. **`isDisabled` is a top-level node field**, not config — PATCH it at the node root.
+14. **Scaffold external calls disabled + a placeholder Code node behind them** so the flow is testable without firing live APIs.
+15. **Create endpoints at `POST /new/v2.0/endpoints`** (plain `/v2.0/endpoints` returns 500); `localeId` is the primary locale's `referenceId` UUID.
