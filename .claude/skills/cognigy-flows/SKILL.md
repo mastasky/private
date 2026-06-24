@@ -304,9 +304,37 @@ Caveats — **save the `_id` at creation time**: the `GET /v2.0/aiagents` **list
 }
 ```
 
-**Auto-created children (like If→then/else):** creating an `aiAgentJob` auto-spawns an `aiAgentJobDefault` ("Default", the path taken when the agent just replies) and one `aiAgentJobTool` ("Tool") child. Do not create them manually. For a **pure conversational agent with no tools, delete the empty Tool node** (`DELETE .../chart/nodes/{toolId}`) — an unconfigured tool is dead weight. To give the agent a tool, configure that `aiAgentJobTool` instead: it has `toolId`, `description`, and a JSON-schema `parameters` string; the agent calls it by name and execution flows into the tool's children. Set `knowledgeSearchBehavior: "always"` to attach knowledge-store search.
+**Auto-created children (like If→then/else):** creating an `aiAgentJob` auto-spawns an `aiAgentJobDefault` ("Default", the path taken when the agent just replies) and one `aiAgentJobTool` ("Tool") child. Do not create them manually. For a **pure conversational agent with no tools, delete the empty Tool node** (`DELETE .../chart/nodes/{toolId}`) — an unconfigured tool is dead weight. Set `knowledgeSearchBehavior: "always"` to attach knowledge-store search.
 
 `storeLocation: "stream"` + `outputImmediately: true` streams the reply straight to the user (no Say node needed). The full result is also stored at `input.aiAgentOutput` / `context.aiAgentOutput`.
+
+### Giving an AI Agent a tool
+
+A tool lets the agent call into the flow (look something up, hit an API, run logic) and use the result in its reply. The structure (verified live):
+
+```
+aiAgentJob ──children──> [ aiAgentJobDefault (Default) , aiAgentJobTool (your tool) ]
+aiAgentJobTool ──next──> <your handler nodes> ──next──> aiAgentToolAnswer
+```
+
+1. **Create the tool node** as a child of the agent — `type: "aiAgentJobTool"`, extension `@cognigy/basic-nodes`, `target`=the aiAgentJob `_id`, `mode: "appendChild"`. Config:
+   ```json
+   {
+     "toolId": "get_candy_price",
+     "description": "Look up the price in USD of a specific candy by its name.",
+     "useParameters": true,
+     "parameters": "{\"type\":\"object\",\"properties\":{\"candy\":{\"type\":\"string\",\"description\":\"The candy name to price.\"}},\"required\":[\"candy\"],\"additionalProperties\":false}",
+     "condition": ""
+   }
+   ```
+   `parameters` is a **JSON-schema string** (stringify it). `toolId` is the function name the model calls. `condition` (optional CognigyScript) gates whether the tool is offered.
+2. **Build the handler branch** by appending nodes to the tool node (`target`=tool `_id`, `mode: "append"`): do the work (Code/HTTP/etc.), then end the branch with an **`aiAgentToolAnswer`** node ("Resolve Tool Action").
+3. **Read the call arguments at `input.aiAgent.toolArgs.<paramName>`** — e.g. `input.aiAgent.toolArgs.candy`. (Discovered live; not in the docs.)
+4. **Return the result** via `aiAgentToolAnswer` config `{"answer": "...", "debugToolAnswer": false}`. The `answer` string supports CognigyScript (`{{context.x}}`) and is fed **back to the LLM**, which then phrases the user-facing reply — so make it factual ("A bag of {{context.candyName}} costs ${{context.candyPrice}}."), not a finished sentence.
+
+**Forcing tool use:** `toolChoice: "auto"` lets the model decide — and it will happily answer from its own knowledge instead of calling the tool. If the tool must run (e.g. real prices, not hallucinated ones), say so explicitly in `instructions`: *"For ANY price question you MUST call get_candy_price; never guess a price."*
+
+**Debugging tool runs:** the REST endpoint response does **not** include `context`, so you can't read intermediate values from it. To verify a tool fired, either set a sentinel `answer` (a fake value the bot will parrot) or temporarily append a Say node *after* the agent in the main flow echoing `{{context.x}}` — run one turn, read it, then delete the Say.
 
 ### Voice bots — Set Session Config node
 
@@ -585,3 +613,4 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 17. **AI Agent (`aiAgentJob`) prompt is inline** (`name`/`description`/`instructions`). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
 18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
 19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
+20. **Tools:** add an `aiAgentJobTool` child to the agent, build its handler branch ending in `aiAgentToolAnswer`. Args arrive at `input.aiAgent.toolArgs.<param>`; the answer is fed back to the LLM. Force usage via `instructions` since `toolChoice: "auto"` lets the model skip it.
