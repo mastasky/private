@@ -653,6 +653,90 @@ Notes:
 - **Test every branch** of any logic you added (yes/no, condition true/false) with separate sessions.
 - **Debugging a condition that won't fire:** temporarily echo the runtime value (e.g. `{{input.result}}`) in a downstream Say node, run one turn to read it, then restore. This is how you discover exact field shapes the API doesn't document.
 
+### Running it as an automated test suite (simulations)
+
+"Driving the conversation" becomes a **test** the moment you add assertions and a pass/fail tally. The endpoint *is* the simulation engine — each `sessionId` is one simulated conversation, and you assert on the response. Define your scenarios as data and loop:
+
+```python
+import json, os, uuid, urllib.request
+
+EP_BASE = os.environ.get("COGNIGY_ENDPOINT_BASE", "https://endpoint-trial.cognigy.ai").rstrip("/")
+URL = f"{EP_BASE}/<token>"
+
+def turn(session, text):
+    payload = {"userId": "tester", "sessionId": session, "text": text, "data": {}}
+    req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
+                                  headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+def bot_text(resp):
+    # Final merged reply is the TOP-LEVEL "text" — NOT outputStack.
+    # When an AI Agent streams (storeLocation:"stream"), each outputStack entry is a
+    # partial token chunk with empty text and _finishReason "tool_calls"; the assembled
+    # answer lands in resp["text"]. Assert on resp["text"], not on outputStack.
+    return resp.get("text", "")
+
+# Each case = a list of (userTurn, [substrings that must appear in the reply]).
+# Multi-turn cases share one session; the last turn's reply is asserted.
+SUITE = [
+    {"name": "Logistics classification",
+     "turns": [("My delivery for PO-98765 is overdue, the freight never arrived.",
+                ["Logistics", "Delivery"])]},
+    {"name": "Finance — invoice", "turns": [
+        ("Vendor invoice INV-2024-055 for $45,000 is pending approval.", ["Finance"])]},
+    {"name": "HR — payroll", "turns": [
+        ("My payslip shows wrong deductions, employee ID EMP-10042.", ["HR", "Payroll"])]},
+    {"name": "Entity extraction", "turns": [
+        ("Following up on purchase order PO-12345.", ["PO-12345"])]},
+]
+
+passed = failed = 0
+for case in SUITE:
+    session = str(uuid.uuid4())            # fresh session per scenario
+    reply = ""
+    for user_text, _ in case["turns"]:
+        reply = bot_text(turn(session, user_text))   # last turn's reply is what we assert
+    expected = case["turns"][-1][1]
+    missing = [kw for kw in expected if kw.lower() not in reply.lower()]
+    ok = not missing
+    passed += ok; failed += (not ok)
+    print(f"[{'PASS' if ok else 'FAIL'}] {case['name']}"
+          + (f"  missing={missing}" if missing else ""))
+    if not ok:
+        print(f"    reply: {reply[:200]}")
+print(f"\n{passed}/{passed+failed} passed")
+```
+
+Run this after every structural change as a regression gate. Keep the scenarios alongside the flow so a Cognigy upgrade or an accidental edit that breaks classification/routing fails loudly. Assert on **`resp['text']`** (the merged final reply); only fall back to `resp['data']['text']` for quick-reply/gallery messages where `text` is empty.
+
+### Playbooks (UI simulations) — readable & editable via API, but run is UI-only
+
+Cognigy's built-in "Playbook" simulations (Manage → Playbooks in the UI) are exposed read/write over REST, and a playbook is exactly the scenario data above — a list of user turns, each with optional **asserts**:
+
+```python
+# List playbooks for a flow or project (HAL — under _embedded.playbooks):
+api("GET", f"/v2.0/playbooks?flowId={flow_ref}&limit=100")     # flow_ref = flow referenceId
+api("GET", f"/v2.0/playbooks?projectId={project_id}&limit=100")
+
+# A playbook's shape (GET /v2.0/playbooks/{id}):
+#   { name, abortOnError, timeout, steps: [
+#       { text: "<user turn>", data: {},
+#         asserts: [ { type, params, _id } ] } ] }
+# Assert types seen live: assertText {text, fuzzy, negate}, assertContext {data, partial, negate},
+#                         assertData {data, partial, negate}.
+
+# Create one (POST /v2.0/playbooks) — send projectId, NOT flowId ("Field 'flowId' is not allowed"):
+api("POST", "/v2.0/playbooks", {
+    "name": "Bionic — Logistics", "projectId": project_id,
+    "abortOnError": True, "timeout": 10000,
+    "steps": [{"text": "Delivery for PO-98765 is overdue.", "data": {},
+               "asserts": [{"type": "assertText",
+                            "params": {"text": "Logistics", "fuzzy": True, "negate": False}}]}]})
+```
+
+⚠️ **TRIAL-QUIRK — no programmatic run.** Listing/reading/creating/editing playbooks works, and `GET /v2.0/playbooks/{id}/runs` returns the run history (empty until run from the UI), but every trigger route (`POST .../runs`, `.../run`, `.../execute`, `/playbookruns`, with and without `/new`) returns 404 on this trial. So you can **author** playbooks via the API for someone to run in the UI, but to actually *execute* a simulation programmatically, use the endpoint-driven test suite above — that's the portable path.
+
 ## Pattern: safe external-call scaffolding
 
 When a flow needs to call a real external API (HTTP Request node) that doesn't exist yet, isn't safe to hit, or has no credentials, build it so it's testable end-to-end without making the live call:
@@ -701,3 +785,4 @@ This guide doubles as a field reference and an agent runbook. Before depending o
 22. **All Say nodes must set `preventTranscript`.** Use `preventTranscript: true` to keep output out of the transcript; set it to `false` on a terminal branch message the user must actually see (a terminal `preventTranscript: true` Say is silent in the REST response). The field is `preventTranscript`, never `excludeFromTranscript` (HTTP 400).
 23. **`aiAgentToolAnswer` does NOT render Handlebars block helpers** (`{{#if}}`/`{{#each}}`). Only simple `{{context.x}}` interpolation works; a `{{#if}}` block silently yields nothing, so the LLM receives an answerless result and assumes failure. Build the full answer string in a Code node (e.g. `context.toolMessage = ...`) and set the answer to a plain `{{context.toolMessage}}`.
 24. **Cross-flow `goTo` uses `executionMode: "continue"`**, which runs the target flow inline and (for REST endpoints) flows straight into the agent in the same turn. Because a REST endpoint always re-enters its bound flow's start node every turn, gate multi-turn routing with a *router If at the top of the entry flow* that checks a **`profile`** flag (e.g. `profile.aiConsent === true`) — `context` does not reliably persist across REST turns, `profile` does. Set the flag in a Code node (`profile.aiConsent = true;`) on the consenting branch.
+25. **Test flows by simulation through the endpoint**, with assertions and a pass/fail tally (see "Running it as an automated test suite"). Each `sessionId` is one simulated conversation; assert on `resp['text']` (the merged final reply), not on `outputStack` (streaming chunks have empty text). Cognigy's built-in Playbook simulations are readable/editable via `/v2.0/playbooks` but **cannot be triggered via the API on this trial** (every run route 404s) — the endpoint test suite is the portable path.
