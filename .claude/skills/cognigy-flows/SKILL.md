@@ -382,6 +382,34 @@ def search_project(project_id, pattern, node_type=None):
 
 If the flow is connected to a REST/webhook endpoint (e.g. `https://endpoint-trial.cognigy.ai/<token>`), you can drive a real conversation to verify your changes actually work — not just that the API accepted them. This is the strongest verification.
 
+### Creating a REST endpoint for a flow (if one doesn't exist)
+
+**Critical: the create path is `POST /new/v2.0/endpoints`, NOT `POST /v2.0/endpoints`.** The plain `/v2.0/endpoints` POST returns HTTP 500 — that is the wrong route, not a trial restriction. The working route is under the `/new/` prefix.
+
+The payload needs project/locale/flow identifiers, and **`localeId` must be the locale's `referenceId` UUID** — not the flow's `localeReference` (a 24-char mongo id). Resolving these:
+
+- `projectId` / `entrypoint` = the flow's `projectReference` (from `GET /v2.0/flows/{flowId}`).
+- `flowId` = the flow's `referenceId` (UUID).
+- `localeId` = the **primary** locale's `referenceId`, found via `GET /v2.0/locales?projectId={projectReference}` and picking the entry with `primary: true`.
+
+```python
+flow = api("GET", f"/v2.0/flows/{flow_id}")
+proj = flow["projectReference"]
+flow_ref = flow["referenceId"]
+locales = api("GET", f"/v2.0/locales?projectId={proj}&limit=50")["_embedded"]["locales"]
+locale_uuid = next(l for l in locales if l.get("primary"))["referenceId"]
+
+payload = {
+    "agentId": "", "channel": "rest", "customIcon": "",
+    "entrypoint": proj, "flowId": flow_ref, "localeId": locale_uuid,
+    "name": "My Test Endpoint", "projectId": proj, "targetType": "flow",
+}
+res = api("POST", "/new/v2.0/endpoints", payload)   # 201 on success
+token = res["URLToken"]   # use as https://endpoint-trial.cognigy.ai/{token}
+```
+
+Common 400s: `localeId should be of format 'uuid'` means you passed the mongo `localeReference` instead of the locale `referenceId`. A 500 means you hit `/v2.0/endpoints` instead of `/new/v2.0/endpoints`.
+
 ### FIRST: verify the endpoint actually routes to your flow
 
 **Never test blindly** — an endpoint token may point at a different flow, so you could "verify" a flow you never touched. Before sending any messages, confirm the endpoint's attached flow matches the flow you edited:
