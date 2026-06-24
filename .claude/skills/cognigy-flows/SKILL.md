@@ -219,7 +219,11 @@ def if_config(condition_str):
   "validationMessage": "Not sure I understood that."
 }
 ```
-For yes/no questions use `"type": "yesNo"`. Answer is in `input.slots.yesNo[0].keyphrase` (`'yes'` or `'no'`).
+**Reading a Question's answer in a later node:** the answer is stored in **`input.result`** (the runtime field), regardless of `storeResultInContext`/`contextKey` settings. The type of `input.result` depends on the question type:
+- `"type": "text"` → string (the user's text)
+- `"type": "yesNo"` → **boolean `true` / `false`** (NOT the strings `"yes"`/`"no"`)
+
+So an If node checking a yesNo answer must use `input.result === true`, not `input.result === "yes"` and not `input.slots.yesNo[...]`. Verified live against the trial endpoint. When in doubt, probe the real value: temporarily echo `{{input.result}}` in a downstream Say node.
 
 **Code** — pure JS, key is `code` (not `script`):
 ```json
@@ -283,6 +287,35 @@ api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
 
 ---
 
+## Verifying a flow by talking to it (end-to-end test)
+
+If the flow is connected to a REST/webhook endpoint (e.g. `https://endpoint-trial.cognigy.ai/<token>`), you can drive a real conversation to verify your changes actually work — not just that the API accepted them. This is the strongest verification.
+
+```python
+import json, uuid, urllib.request, time
+
+URL = "https://endpoint-trial.cognigy.ai/<token>"
+session = str(uuid.uuid4())   # one session = one conversation thread
+
+def send(text):
+    payload = {"userId": "tester", "sessionId": session, "text": text, "data": {}}
+    req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
+                                  headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read().decode())
+    # Plain text is in resp["text"]; quick-reply/rich messages are in resp["data"]["text"][0]
+    return resp
+
+send("")        # empty first message triggers the entry flow
+send("Encode")  # then send each user turn in sequence
+```
+
+Notes:
+- Reuse the **same `sessionId`** across turns to keep conversation state; use a **fresh** one per test scenario.
+- The bot reply is in `resp["text"]`; for quick-reply/gallery messages `text` is empty and the content is under `resp["data"]["text"]` / `resp["data"]["_cognigy"]`.
+- **Test every branch** of any logic you added (yes/no, condition true/false) with separate sessions.
+- **Debugging a condition that won't fire:** temporarily echo the runtime value (e.g. `{{input.result}}`) in a downstream Say node, run one turn to read it, then restore. This is how you discover exact field shapes the API doesn't document.
+
 ## Workflow rules
 
 1. **Use the chart endpoint** (`GET /chart`) for reading structure — not the paginated nodes endpoint.
@@ -292,5 +325,7 @@ api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
 5. **GoTo needs referenceId (UUID), not _id** — fetch flow object and chart nodes to get them.
 6. **Say and Question `text` fields are always arrays**, not strings.
 7. **Code node is pure ECMAScript** — no Node.js globals at all.
-8. **Confirm destructive operations** — ask before delete or move.
-9. **After any mutation**, re-fetch and display the chart so the user sees current state.
+8. **Question answers live in `input.result`** — yesNo is a boolean (`true`/`false`), text is a string.
+9. **Confirm destructive operations** — ask before delete or move.
+10. **After any mutation**, re-fetch and display the chart so the user sees current state.
+11. **Verify behaviour, not just acceptance** — if an endpoint is available, drive a real conversation through every branch before declaring done.
