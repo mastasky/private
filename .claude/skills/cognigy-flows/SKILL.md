@@ -330,13 +330,14 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
 
 **Creating a persona (AI Agent resource):** `POST /v2.0/aiagents` needs only `projectId` + `name` (201). The resource holds identity/delivery config — `image`, `speakingStyle`, `voiceConfigs` / `enableVoiceConfigs`, `safetySettings`, `enableAutoLanguageDetection`, `contactProfilesOption` — **not** the prompt: `description`/`instructions` stay inline on the node. Use the returned `referenceId` as the node's `aiAgent`.
 
-**Always set the persona `image`.** Default to `"default-avatar:0"`. Accepted both at create and via PATCH. Captured the node's `_id` and `referenceId` from the create response — you need the **mongo `_id`** for any later GET/PATCH/DELETE.
+**Always set the persona `image`** — and whenever you set `image`, also set **`imageOptimizedFormat: true`** (both at create and on any PATCH that changes the image). Default `image` to `"default-avatar:0"`. Capture the node's `_id` and `referenceId` from the create response — you need the **mongo `_id`** for any later GET/PATCH/DELETE.
 
 ```python
 agent = api("POST", "/v2.0/aiagents",
-            {"projectId": project_id, "name": "Mr. Sweet", "image": "default-avatar:0"})
+            {"projectId": project_id, "name": "Mr. Sweet",
+             "image": "default-avatar:0", "imageOptimizedFormat": True})
 agent_ref, agent_id = agent["referenceId"], agent["_id"]   # ref → config["aiAgent"]; _id → updates
-# update later:  api("PATCH", f"/v2.0/aiagents/{agent_id}", {"image": "default-avatar:0"})
+# update later:  api("PATCH", f"/v2.0/aiagents/{agent_id}", {"image": "default-avatar:0", "imageOptimizedFormat": True})
 # delete:        api("DELETE", f"/v2.0/aiagents/{agent_id}")
 ```
 
@@ -693,7 +694,7 @@ This guide doubles as a field reference and an agent runbook. Before depending o
 16. **Create flows with `POST /v2.0/flows` (projectId + name only)** — no `localeId`. They come with start/end nodes already.
 16a. **Always ask which project to build in** unless the user named it unambiguously — never default to `projects[0]`. And **verify the project has an LLM** (`/largelanguagemodels`) before adding an AI Agent: an empty list means the agent will silently return empty output. Don't reuse an `llmProviderReferenceId` from another project — referenceIds aren't portable.
 17. **AI Agent (`aiAgentJob`) prompt is inline** (`name`/`description`/`instructions`). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
-18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
+18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's. Always set `image` (default `"default-avatar:0"`) together with `imageOptimizedFormat: true`.
 19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
 20. **Tools:** add an `aiAgentJobTool` child to the agent, build its handler branch ending in `aiAgentToolAnswer`. Args arrive at `input.aiAgent.toolArgs.<param>`; the answer is fed back to the LLM. Force usage via `instructions` since `toolChoice: "auto"` lets the model skip it.
 21. **No Question or GoTo nodes in tool-assisted / AI Agent flows.** These node types are incompatible with the AI Agent conversation model — use Code, HTTP Request, If, and aiAgentToolAnswer instead.
