@@ -6,22 +6,33 @@ Manage Cognigy.AI Flows: read structure, understand nodes, create/edit/move/dele
 
 ```
 BASE_URL = https://api-trial.cognigy.ai
-API_KEY  = 4704471a069ce9a4c9a8cea0caf6002fc56715862882c1a788a5da349c94afe3adf032e9ea35a29708c50379c59043d77f81a4de02d02ec686e6e15a1b9efa81
 ```
 
 All requests use header: `X-API-Key: <API_KEY>`
+
+### Getting the API key
+
+The API key is **not** stored in this skill. At the start of a session, obtain it in this order:
+
+1. If `COGNIGY_API_KEY` is set in the environment, use it.
+2. Otherwise, **ask the user in chat** for their Cognigy API key before making any API call.
+
+Keep the key in memory for the session only — never write it to `SKILL.md`, commit it, or echo it back in output. When writing the helper script, inject the key from the environment (see below) rather than pasting the literal value.
 
 ---
 
 ## Python helper
 
-All API calls use this pattern — write to `/tmp/cognigy_op.py` then run it:
+All API calls use this pattern — write to `/tmp/cognigy_op.py` then run it.
+
+Pass the key via the environment, never inline. Run the script as:
+`COGNIGY_API_KEY="<key the user gave you>" python3 /tmp/cognigy_op.py`
 
 ```python
-import json, urllib.request, urllib.error, sys
+import json, os, urllib.request, urllib.error, sys
 
 BASE = "https://api-trial.cognigy.ai"
-KEY  = "4704471a069ce9a4c9a8cea0caf6002fc56715862882c1a788a5da349c94afe3adf032e9ea35a29708c50379c59043d77f81a4de02d02ec686e6e15a1b9efa81"
+KEY  = os.environ["COGNIGY_API_KEY"]   # ask the user for this; do not hardcode
 HEADERS = {"X-API-Key": KEY, "Content-Type": "application/json"}
 
 def api(method, path, body=None):
