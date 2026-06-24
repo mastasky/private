@@ -1,3 +1,8 @@
+---
+name: cognigy-flows
+description: Manage Cognigy.AI Flows via the REST API — read flow structure and create/edit/move/delete nodes (Say, Question, If, Code, GoTo, AI Agent + tools), building both deterministic and AI-agent conversation flows. Use when working with Cognigy.AI, building chatbots or voicebots, or editing Cognigy conversation flows.
+---
+
 # cognigy-flows
 
 Manage Cognigy.AI Flows: read structure, understand nodes, create/edit/move/delete nodes.
