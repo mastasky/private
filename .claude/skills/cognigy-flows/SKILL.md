@@ -5,8 +5,10 @@ Manage Cognigy.AI Flows: read structure, understand nodes, create/edit/move/dele
 ## Constants
 
 ```
-BASE_URL = https://api-trial.cognigy.ai
+BASE_URL = https://api-trial.cognigy.ai/new
 ```
+
+**Always use the `/new` namespace.** All calls go to `https://api-trial.cognigy.ai/new/v2.0/...`. The `/new` prefix is a strict superset of the plain `/v2.0` API — everything that works without it works with it, and some routes (e.g. creating endpoints) **only** work under `/new`. The helper below bakes `/new` into `BASE`, so every `path` you pass starts at `/v2.0/...` and is automatically served from `/new`.
 
 All requests use header: `X-API-Key: <API_KEY>`
 
@@ -31,7 +33,7 @@ Pass the key via the environment, never inline. Run the script as:
 ```python
 import json, os, urllib.request, urllib.error, sys
 
-BASE = "https://api-trial.cognigy.ai"
+BASE = "https://api-trial.cognigy.ai/new"   # always use the /new namespace
 KEY  = os.environ["COGNIGY_API_KEY"]   # ask the user for this; do not hardcode
 HEADERS = {"X-API-Key": KEY, "Content-Type": "application/json"}
 
@@ -272,15 +274,19 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
 - `llmProviderReferenceId` — a Large Language Model resource. List them: `GET /v2.0/largelanguagemodels?projectId={projectId}` (returns `referenceId` + `name` + model). gpt-4o works well: `86e64e87-9c22-4013-98a9-219d8ec978d0` in this trial.
 - `aiAgent` — an AI Agent resource (persona) referenceId. **Prefer creating a dedicated persona per agent** rather than borrowing one — it's cheap and keeps voice/identity/safety config separate.
 
-**Creating a persona (AI Agent resource):** `POST /v2.0/aiagents` needs only `projectId` + `name` (201). The resource holds identity/delivery config — `speakingStyle`, `voiceConfigs` / `enableVoiceConfigs`, `safetySettings`, `enableAutoLanguageDetection`, `contactProfilesOption` — **not** the prompt: `description`/`instructions` stay inline on the node. Use the returned `referenceId` as the node's `aiAgent`.
+**Creating a persona (AI Agent resource):** `POST /v2.0/aiagents` needs only `projectId` + `name` (201). The resource holds identity/delivery config — `image`, `speakingStyle`, `voiceConfigs` / `enableVoiceConfigs`, `safetySettings`, `enableAutoLanguageDetection`, `contactProfilesOption` — **not** the prompt: `description`/`instructions` stay inline on the node. Use the returned `referenceId` as the node's `aiAgent`.
+
+**Always set the persona `image`.** Default to `"default-avatar:0"`. Accepted both at create and via PATCH. Captured the node's `_id` and `referenceId` from the create response — you need the **mongo `_id`** for any later GET/PATCH/DELETE.
 
 ```python
-agent = api("POST", "/v2.0/aiagents", {"projectId": project_id, "name": "Mr. Sweet"})
-agent_ref = agent["referenceId"]          # use as config["aiAgent"]
-# delete with the mongo _id (not the referenceId): DELETE /v2.0/aiagents/{agent["_id"]}
+agent = api("POST", "/v2.0/aiagents",
+            {"projectId": project_id, "name": "Mr. Sweet", "image": "default-avatar:0"})
+agent_ref, agent_id = agent["referenceId"], agent["_id"]   # ref → config["aiAgent"]; _id → updates
+# update later:  api("PATCH", f"/v2.0/aiagents/{agent_id}", {"image": "default-avatar:0"})
+# delete:        api("DELETE", f"/v2.0/aiagents/{agent_id}")
 ```
 
-Caveats: the `GET /v2.0/aiagents` **list** endpoint 500s in this trial and the single-GET wants a mongo-id — so to discover an *existing* persona's referenceId, copy it from an existing `aiAgentJob` node's config. Creating a fresh one (above) sidesteps both. Reusing one persona across flows in the same project is also fine.
+Caveats — **save the `_id` at creation time**: the `GET /v2.0/aiagents` **list** endpoint 500s in this trial (under `/new` too — it's a trial bug, not a namespace issue), the single-GET/PATCH/DELETE require the mongo `_id`, and there is **no referenceId→`_id` lookup**. If you only have a persona's `referenceId` (e.g. copied from a node), you cannot edit or delete that persona via the API — you'd have to recreate it (names must be unique, so a duplicate name 409s) or fix it in the UI. So: capture `_id` when you create, and reuse one persona across flows rather than orphaning duplicates.
 
 ```json
 {
@@ -309,20 +315,22 @@ For **voice bots**, place a **Set Session Config** node (`type: "setSessionConfi
 Key config options (full set verified live; all optional — defaults shown are sane):
 - **TTS (how the bot speaks):** `ttsVendor` (`"none"` = inherit endpoint default, else e.g. `"google"`/`"elevenlabs"`/`"azure"`), `ttsVoice`, `ttsLanguage`, `ttsModel`, `ttsDisableCache`.
 - **STT (how it hears):** `sttVendor`, `sttLanguage`, `sttModel`, `sttHints` (array of bias phrases), `sttDisablePunctuation`, `googleModel` (e.g. `"latest_short"`). Azure/Google multi-language recognition via `recognizeLanguagesAzure`/`recognizeLanguagesGoogle` + `stt*Lang1..3`.
-- **Barge-in (caller interrupts the bot):** `bargeInOnSpeech` (bool), `bargeInMinWordCount` (e.g. `2`), `bargeInOnDtmf`.
+- **Barge-in (caller interrupts the bot) — turn this on for voice bots:** `bargeInOnSpeech: true` lets the caller cut in while the bot is talking; `bargeInMinWordCount: 2` requires ≥2 words so coughs / "uh" / background noise don't falsely interrupt; `bargeInOnDtmf: true` also interrupts on a keypad press. Without barge-in a voice bot feels robotic — the caller has to wait out every prompt.
 - **Endpointing (when a turn ends):** `deepgramEndpointing` + `deepgramEndpointingValue` (ms, e.g. `250`), `sttVadEnabled`, `sttVadMode`, `sttVadVoiceMs`.
 - **No-input handling:** `userNoInputTimeoutEnable`, `userNoInputTimeout` (ms), `userNoInputRetries`, `userNoInputMode` (`"event"`/`"play"`), `userNoInputSpeech`/`userNoInputUrl`; flow-level equivalents `flowNoInput*`.
 - **DTMF (keypad):** `dtmfEnable`, `dtmfMaxDigits`/`dtmfMinDigits`, `dtmfInterDigitTimeout`, `dtmfSubmitDigit` (e.g. `"#"`).
 - **Ambience/overlay:** `atmosphereUrl`/`atmosphereVolume`/`atmosphereLoop`, `silenceOverlayURL`/`silenceOverlayDelay`.
 - **Raw passthrough:** `sessionParams` (JSON string) for vendor params not exposed as fields.
 
-Minimal voice-friendly config (let the endpoint's defaults stand, just enable barge-in + no-input recovery):
+Recommended voice-friendly config (inherit the endpoint's voice, enable barge-in + no-input recovery):
 ```json
-{"ttsVendor": "none", "sttVendor": "none", "bargeInOnSpeech": true, "bargeInMinWordCount": 2,
+{"ttsVendor": "none", "sttVendor": "none",
+ "bargeInOnSpeech": true, "bargeInMinWordCount": 2, "bargeInOnDtmf": true,
  "userNoInputTimeoutEnable": true, "userNoInputTimeout": 10000, "userNoInputRetries": 1,
  "userNoInputMode": "event", "deepgramEndpointing": true, "deepgramEndpointingValue": 250,
  "sessionParams": "{}"}
 ```
+Verify placement after creating it: in the chart `relations`, each node has a `next` pointer — confirm the chain reads `start → setSessionConfig → aiAgentJob`. `append` on the start node inserts it right after start, ahead of whatever already followed.
 `"none"` for `sttVendor`/`ttsVendor` means "use whatever the voice endpoint is already configured with" — safe default when you don't need to override the voice.
 
 ### Code node sandbox restrictions
@@ -462,7 +470,7 @@ If the flow is connected to a REST/webhook endpoint (e.g. `https://endpoint-tria
 
 ### Creating a REST endpoint for a flow (if one doesn't exist)
 
-**Critical: the create path is `POST /new/v2.0/endpoints`, NOT `POST /v2.0/endpoints`.** The plain `/v2.0/endpoints` POST returns HTTP 500 — that is the wrong route, not a trial restriction. The working route is under the `/new/` prefix.
+**Critical: endpoint creation only works under the `/new` namespace.** Since the helper's `BASE` already includes `/new`, call `api("POST", "/v2.0/endpoints", ...)` — it resolves to `/new/v2.0/endpoints`. Hitting the host *without* `/new` (plain `https://api-trial.cognigy.ai/v2.0/endpoints`) returns HTTP 500. This is the clearest case of why the whole skill defaults to `/new`.
 
 The payload needs project/locale/flow identifiers, and **`localeId` must be the locale's `referenceId` UUID** — not the flow's `localeReference` (a 24-char mongo id). Resolving these:
 
@@ -482,11 +490,11 @@ payload = {
     "entrypoint": proj, "flowId": flow_ref, "localeId": locale_uuid,
     "name": "My Test Endpoint", "projectId": proj, "targetType": "flow",
 }
-res = api("POST", "/new/v2.0/endpoints", payload)   # 201 on success
+res = api("POST", "/v2.0/endpoints", payload)   # BASE has /new → /new/v2.0/endpoints; 201 on success
 token = res["URLToken"]   # use as https://endpoint-trial.cognigy.ai/{token}
 ```
 
-Common 400s: `localeId should be of format 'uuid'` means you passed the mongo `localeReference` instead of the locale `referenceId`. A 500 means you hit `/v2.0/endpoints` instead of `/new/v2.0/endpoints`.
+Common 400s: `localeId should be of format 'uuid'` means you passed the mongo `localeReference` instead of the locale `referenceId`. A 500 means your `BASE` is missing `/new` (you hit plain `/v2.0/endpoints`).
 
 ### FIRST: verify the endpoint actually routes to your flow
 
@@ -572,7 +580,7 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 12. **Confirm the endpoint routes to your flow before testing** — match the endpoint's `flowId` (a referenceId) to the flow's `referenceId`. Never report results from an endpoint you haven't confirmed.
 13. **`isDisabled` is a top-level node field**, not config — PATCH it at the node root.
 14. **Scaffold external calls disabled + a placeholder Code node behind them** so the flow is testable without firing live APIs.
-15. **Create endpoints at `POST /new/v2.0/endpoints`** (plain `/v2.0/endpoints` returns 500); `localeId` is the primary locale's `referenceId` UUID.
+15. **Always use the `/new` namespace** — `BASE` ends in `/new`, so paths start at `/v2.0/...`. Endpoint creation (`/v2.0/endpoints`) only works under `/new`; without it you get 500. `localeId` for endpoint creation is the primary locale's `referenceId` UUID.
 16. **Create flows with `POST /v2.0/flows` (projectId + name only)** — no `localeId`. They come with start/end nodes already.
 17. **AI Agent (`aiAgentJob`) prompt is inline** (`name`/`description`/`instructions`). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
 18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
