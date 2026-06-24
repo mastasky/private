@@ -101,6 +101,17 @@ for f in all_flows:
     print(fid, name)
 ```
 
+### Creating a flow
+
+`POST /v2.0/flows` with just `projectId` + `name` (201 on success). **Do NOT send `localeId`** — it's rejected ("Field 'localeId' is not allowed"); the flow inherits the project's locales. A fresh flow comes with a `start` and an `end` node already wired — fetch the chart to get the start node's `_id` before adding nodes.
+
+```python
+flow = api("POST", "/v2.0/flows", {"projectId": project_id, "name": "My Flow"})
+flow_id = flow["_id"]
+chart = api("GET", f"/v2.0/flows/{flow_id}/chart")
+start_id = next(n["_id"] for n in chart["nodes"] if n["type"] == "start")
+```
+
 ---
 
 ## Step 3 — Read flow structure
@@ -256,6 +267,30 @@ So an If node checking a yesNo answer must use `input.result === true`, not `inp
   "parseKeyphrases": false
 }
 ```
+
+**AI Agent** (`aiAgentJob`) — an LLM-driven conversational agent. Extension is `@cognigy/basic-nodes` like the others. The persona is defined **inline** via `name` / `description` / `instructions`; two reference fields link shared project resources:
+- `llmProviderReferenceId` — a Large Language Model resource. List them: `GET /v2.0/largelanguagemodels?projectId={projectId}` (returns `referenceId` + `name` + model). gpt-4o works well: `86e64e87-9c22-4013-98a9-219d8ec978d0` in this trial.
+- `aiAgent` — an AI Agent resource referenceId. The `GET /v2.0/aiagents` list endpoint 500s in this trial and the single-GET wants a mongo-id, so the practical way to obtain a valid `aiAgent` referenceId is to **copy it from an existing AI Agent node** (read another flow's `aiAgentJob` config). Reusing one across flows in the same project works fine; the persona still comes from the inline fields, not the referenced resource.
+
+```json
+{
+  "aiAgent": "<aiAgent-referenceId copied from an existing node>",
+  "llmProviderReferenceId": "<llm referenceId>",
+  "name": "Candy Salesman",
+  "description": "Short summary of who the agent is.",
+  "instructions": "- Bullet-point behaviour rules.\n- Stay on topic; decline off-topic asks.",
+  "toolChoice": "auto", "memoryType": "inherit",
+  "knowledgeSearchBehavior": "never",
+  "apiVersion": "1.0", "timeoutInMs": 8000, "maxTokens": 4000, "temperature": 0.8,
+  "errorHandling": "continue", "storeLocation": "stream", "streamStoreCopyInInput": true,
+  "inputKey": "aiAgentOutput", "contextKey": "aiAgentOutput", "outputImmediately": true,
+  "streamStopTokens": [".", "!", "?", "\\n"]
+}
+```
+
+**Auto-created children (like If→then/else):** creating an `aiAgentJob` auto-spawns an `aiAgentJobDefault` ("Default", the path taken when the agent just replies) and one `aiAgentJobTool` ("Tool") child. Do not create them manually. For a **pure conversational agent with no tools, delete the empty Tool node** (`DELETE .../chart/nodes/{toolId}`) — an unconfigured tool is dead weight. To give the agent a tool, configure that `aiAgentJobTool` instead: it has `toolId`, `description`, and a JSON-schema `parameters` string; the agent calls it by name and execution flows into the tool's children. Set `knowledgeSearchBehavior: "always"` to attach knowledge-store search.
+
+`storeLocation: "stream"` + `outputImmediately: true` streams the reply straight to the user (no Say node needed). The full result is also stored at `input.aiAgentOutput` / `context.aiAgentOutput`.
 
 ### Code node sandbox restrictions
 
@@ -505,3 +540,5 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 13. **`isDisabled` is a top-level node field**, not config — PATCH it at the node root.
 14. **Scaffold external calls disabled + a placeholder Code node behind them** so the flow is testable without firing live APIs.
 15. **Create endpoints at `POST /new/v2.0/endpoints`** (plain `/v2.0/endpoints` returns 500); `localeId` is the primary locale's `referenceId` UUID.
+16. **Create flows with `POST /v2.0/flows` (projectId + name only)** — no `localeId`. They come with start/end nodes already.
+17. **AI Agent (`aiAgentJob`) persona is inline** (`name`/`description`/`instructions`); copy a valid `aiAgent` referenceId from an existing node (the list endpoint 500s). It auto-creates Default + Tool children — delete the Tool for a tool-free agent.
