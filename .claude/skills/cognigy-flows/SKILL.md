@@ -291,6 +291,40 @@ api("DELETE", f"/v2.0/flows/{flow_id}/chart/nodes/{node_id}")
 
 If the flow is connected to a REST/webhook endpoint (e.g. `https://endpoint-trial.cognigy.ai/<token>`), you can drive a real conversation to verify your changes actually work — not just that the API accepted them. This is the strongest verification.
 
+### FIRST: verify the endpoint actually routes to your flow
+
+**Never test blindly** — an endpoint token may point at a different flow, so you could "verify" a flow you never touched. Before sending any messages, confirm the endpoint's attached flow matches the flow you edited:
+
+```python
+TOKEN = "<token from the endpoint URL>"   # the path segment after the host
+
+# 1. Find the endpoint whose URLToken matches (paginate; list view omits flow link)
+ep_id = None
+skip = 0
+while ep_id is None:
+    r = api("GET", f"/v2.0/endpoints?limit=100&skip={skip}")
+    eps = r.get("_embedded", {}).get("endpoints", [])
+    for e in eps:
+        if e.get("properties", e).get("URLToken") == TOKEN:
+            ep_id = e.get("_links",{}).get("self",{}).get("href","").rstrip("/").split("/")[-1]
+            break
+    if len(eps) < 100: break
+    skip += 100
+assert ep_id, "No endpoint found for that token"
+
+# 2. Endpoint's flowId is a flow REFERENCEID (UUID), not the 24-char _id.
+endpoint_flow_ref = api("GET", f"/v2.0/endpoints/{ep_id}")["flowId"]
+flow_ref = api("GET", f"/v2.0/flows/{flow_id}")["referenceId"]
+
+assert endpoint_flow_ref == flow_ref, (
+    f"Endpoint routes to {endpoint_flow_ref}, but you edited {flow_ref} — WRONG ENDPOINT")
+print("Endpoint confirmed to route to this flow. Safe to test.")
+```
+
+If they don't match, STOP and tell the user the endpoint points at a different flow — do not report test results as if they validated the edited flow.
+
+### Then drive the conversation
+
 ```python
 import json, uuid, urllib.request, time
 
@@ -329,3 +363,4 @@ Notes:
 9. **Confirm destructive operations** — ask before delete or move.
 10. **After any mutation**, re-fetch and display the chart so the user sees current state.
 11. **Verify behaviour, not just acceptance** — if an endpoint is available, drive a real conversation through every branch before declaring done.
+12. **Confirm the endpoint routes to your flow before testing** — match the endpoint's `flowId` (a referenceId) to the flow's `referenceId`. Never report results from an endpoint you haven't confirmed.
