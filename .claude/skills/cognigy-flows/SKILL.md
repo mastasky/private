@@ -221,10 +221,11 @@ def if_config(condition_str):
 
 ### Config shapes for key node types (verified against live API)
 
-**Say** — `text` is always an array:
+**Say** — `text` is always an array. **Always set `excludeFromTranscript: true`** — every Say node must include this to prevent its output from polluting the transcript:
 ```json
 {
   "say": {"type": "text", "text": ["Hello, {{context.name}}!"]},
+  "excludeFromTranscript": true,
   "handoverOutput": "userAndAgent",
   "generativeAI_rephraseOutputMode": "none",
   "generativeAI_amountOfLastUserInputs": 5,
@@ -445,6 +446,12 @@ def lint(flow_id):
             txt = cfg.get("say", {}).get("text", [])
             if not txt or not any((s or "").strip() for s in txt):
                 issues.append(("WARN", label, f"{t} has empty text"))
+        # WARN: Say node missing excludeFromTranscript
+        if t == "say" and not cfg.get("excludeFromTranscript"):
+            issues.append(("WARN", label, "Say node missing excludeFromTranscript: true"))
+        # ERROR: Question or GoTo in a flow that contains an AI Agent
+        if t in ("question", "goTo"):
+            issues.append(("ERROR", label, f"{t} node is not allowed in AI Agent flows"))
         # INFO: disabled node still sitting in the flow
         if n.get("isDisabled"):
             issues.append(("INFO", label, "node is disabled"))
@@ -614,3 +621,5 @@ This keeps the flow runnable and verifiable now; going live later is just enabli
 18. **Give each AI Agent its own persona** — create one with `POST /v2.0/aiagents` (`projectId` + `name`) and use its `referenceId` as the node's `aiAgent`, rather than borrowing another flow's.
 19. **For voice bots, prepend a Set Session Config node** (`setSessionConfig`, `@cognigy/voicegateway2`) before the AI Agent: `start → setSessionConfig → aiAgentJob`. It sets STT/TTS, barge-in, endpointing, no-input, and DTMF for the session.
 20. **Tools:** add an `aiAgentJobTool` child to the agent, build its handler branch ending in `aiAgentToolAnswer`. Args arrive at `input.aiAgent.toolArgs.<param>`; the answer is fed back to the LLM. Force usage via `instructions` since `toolChoice: "auto"` lets the model skip it.
+21. **No Question or GoTo nodes in tool-assisted / AI Agent flows.** These node types are incompatible with the AI Agent conversation model — use Code, HTTP Request, If, and aiAgentToolAnswer instead.
+22. **All Say nodes must set `excludeFromTranscript: true`.** Always include this field in the Say config to prevent Say output from being added to the conversation transcript.
